@@ -1,116 +1,132 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
-import "@openzeppelin/contracts/utils/Address.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "solmate/tokens/ERC721.sol";
+import {SignUtils} from "./library/SignUtils.sol";
 
-contract ERC721Marketplace is IERC721Receiver {
-    using Address for address;
-    using ECDSA for bytes32;
-
+contract ERC721Marketplace {
     struct Listing {
-        address payable seller;
-        address payable buyer;
+        address token;
         uint256 tokenId;
         uint256 price;
-        uint256 deadline;
-        bool isConfirmed;
+        bytes sig;
+        // Slot 4
+        uint88 deadline;
+        address lister;
+        bool active;
     }
 
-    mapping(uint256 => Listing) public listings; // Use an incrementing ID for listings
-    uint256 public listingCount = 0; // Keep track of the number of listings
+    mapping(uint256 => Listing) public listings;
+    address public admin;
+    uint256 public listingId;
 
-    IERC721 public nftContract;
+    /* ERRORS */
+    error NotOwner();
+    error NotApproved();
+    error MinPriceTooLow();
+    error DeadlineTooSoon();
+    error MinDurationNotMet();
+    error InvalidSignature();
+    error ListingNotExistent();
+    error ListingNotActive();
+    error PriceNotMet(int256 difference);
+    error ListingExpired();
+    error PriceMismatch(uint256 originalPrice);
 
-    event ListingCreated(
-        uint256 listingId,
-        address seller,
-        uint256 tokenId,
-        uint256 price,
-        uint256 deadline
-    );
-    event ListingConfirmed(uint256 listingId, address buyer);
+    /* EVENTS */
+    event ListingCreated(uint256 indexed listingId, Listing);
+    event ListingExecuted(uint256 indexed listingId, Listing);
+    event ListingEdited(uint256 indexed listingId, Listing);
 
-    constructor(address _nftContract) {
-        nftContract = IERC721(_nftContract);
+    constructor() {
+        admin = msg.sender;
     }
 
-    function createListing(
-        uint256 _tokenId,
-        uint256 _price,
-        uint256 _deadline,
-        bytes calldata _signature
-    ) external payable {
-        uint256 listingId = listingCount; // Use listingCount as the ID
-        listingCount++; // Increment the listingCount
+    function createListing(Listing calldata l) public returns (uint256 lId) {
+        if (ERC721(l.token).ownerOf(l.tokenId) != msg.sender) revert NotOwner();
+        if (!ERC721(l.token).isApprovedForAll(msg.sender, address(this)))
+            revert NotApproved();
+        if (l.price < 0.01 ether) revert MinPriceTooLow();
+        if (l.deadline < block.timestamp) revert DeadlineTooSoon();
+        if (l.deadline - block.timestamp < 60 minutes)
+            revert MinDurationNotMet();
 
-        bytes32 listingHash = keccak256(
-            abi.encodePacked(listingId, msg.sender, _tokenId, _price, _deadline)
-        );
-        require(
-            listings[listingId].seller == address(0),
-            "Listing already exists"
-        );
+        // Assert signature
+        if (
+            !SignUtils.isValid(
+                SignUtils.constructMessageHash(
+                    l.token,
+                    l.tokenId,
+                    l.price,
+                    l.deadline,
+                    l.lister
+                ),
+                l.sig,
+                msg.sender
+            )
+        ) revert InvalidSignature();
 
-        require(listingId < listingCount, "Invalid listing ID");
-        require(msg.value == _price, "Incorrect payment amount");
-        require(block.timestamp <= _deadline, "Listing deadline has passed");
-        require(_verifyVRS(listingHash, _signature), "Invalid VRS signature");
+        // append to Storage
+        Listing storage li = listings[listingId];
+        li.token = l.token;
+        li.tokenId = l.tokenId;
+        li.price = l.price;
+        li.sig = l.sig;
+        li.deadline = uint88(l.deadline);
+        li.lister = msg.sender;
+        li.active = true;
 
-        listings[listingId] = Listing({
-            seller: payable(msg.sender),
-            buyer: payable(address(0)),
-            tokenId: _tokenId,
-            price: _price,
-            deadline: _deadline,
-            isConfirmed: false
-        });
-
-        emit ListingCreated(listingId, msg.sender, _tokenId, _price, _deadline);
+        // Emit event
+        emit ListingCreated(listingId, l);
+        lId = listingId;
+        listingId++;
+        return lId;
     }
 
-    function confirmListing(uint256 _listingId) external payable {
+    function executeListing(uint256 _listingId) public payable {
+        if (_listingId >= listingId) revert ListingNotExistent();
         Listing storage listing = listings[_listingId];
-        require(listing.seller != address(0), "Listing does not exist");
-        require(!listing.isConfirmed, "Listing already confirmed");
-        require(msg.value == listing.price, "Incorrect payment amount");
-        require(
-            block.timestamp <= listing.deadline,
-            "Listing deadline has passed"
-        );
+        if (listing.deadline < block.timestamp) revert ListingExpired();
+        if (!listing.active) revert ListingNotActive();
+        if (listing.price < msg.value) revert PriceMismatch(listing.price);
+        if (listing.price != msg.value)
+            revert PriceNotMet(int256(listing.price) - int256(msg.value));
 
-        listing.buyer = payable(msg.sender);
-        listing.isConfirmed = true;
+        // Update state
+        listing.active = false;
 
-        nftContract.safeTransferFrom(
-            listing.seller,
-            listing.buyer,
+        // transfer
+        ERC721(listing.token).transferFrom(
+            listing.lister,
+            msg.sender,
             listing.tokenId
         );
 
-        // Transfer Ether from buyer to seller
-        (bool success, ) = listing.seller.call{value: msg.value}("");
-        require(success, "Transfer failed");
+        // transfer eth
+        payable(listing.lister).transfer(listing.price);
 
-        emit ListingConfirmed(_listingId, msg.sender);
+        // Update storage
+        emit ListingExecuted(_listingId, listing);
     }
 
-    function _verifyVRS(
-        bytes32 _messageHash,
-        bytes memory _signature
-    ) internal view returns (bool) {
-        address signer = ECDSA.recover(_messageHash, _signature);
-        return signer == listings[uint256(_messageHash)].seller;
+    function editListing(
+        uint256 _listingId,
+        uint256 _newPrice,
+        bool _active
+    ) public {
+        if (_listingId >= listingId) revert ListingNotExistent();
+        Listing storage listing = listings[_listingId];
+        if (listing.lister != msg.sender) revert NotOwner();
+        listing.price = _newPrice;
+        listing.active = _active;
+        emit ListingEdited(_listingId, listing);
     }
 
-    function onERC721Received(
-        address,
-        address,
-        uint256,
-        bytes calldata
-    ) external pure override returns (bytes4) {
-        return this.onERC721Received.selector;
+    // add getter for listing
+    function getListing(
+        uint256 _listingId
+    ) public view returns (Listing memory) {
+        // if (_listingId >= listingId)
+        return listings[_listingId];
     }
 }
